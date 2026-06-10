@@ -16,6 +16,29 @@ from kilosort.utils import log_performance
 
 logger = logging.getLogger(__name__)
 
+CLUSTERING_GPU_LIMIT_BYTES = 2 * 2**30
+CLUSTERING_ASSIGN_CHUNK = 65536
+CLUSTERING_KMEANS_CHUNK = 65536
+
+
+def use_chunked_gpu_work(nbytes, device):
+    device = torch.device(device)
+    if device.type != 'cuda':
+        return False
+
+    try:
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        free_memory, total_memory = torch.cuda.mem_get_info(device_index)
+        return (
+            nbytes > CLUSTERING_GPU_LIMIT_BYTES
+            or nbytes > 0.5 * free_memory
+            or nbytes > 0.35 * total_memory
+            )
+    except Exception:
+        return nbytes > CLUSTERING_GPU_LIMIT_BYTES
+
 
 def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
     # Xd is spikes by PCA features in a local neighborhood
@@ -68,6 +91,31 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
 
 def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device=torch.device('cuda')):
     n_spikes = kn.shape[0]
+    dense_nbytes = n_spikes * int(nclust) * tones2.element_size()
+    if use_chunked_gpu_work(dense_nbytes, device):
+        iclust = torch.empty(n_spikes, dtype=torch.long, device=device)
+        if lam > 0:
+            kN = torch.bincount(isub, minlength=int(nclust)).to(
+                device=device, dtype=tones2.dtype
+                )
+
+        for start in range(0, n_spikes, CLUSTERING_ASSIGN_CHUNK):
+            end = min(start + CLUSTERING_ASSIGN_CHUNK, n_spikes)
+            chunk_kn = kn[start:end]
+            chunk_rows = torch.arange(end-start, device=device).unsqueeze(-1).tile(
+                (1, chunk_kn.shape[1])
+                )
+            ij = torch.vstack((
+                chunk_rows.flatten(), isub[chunk_kn].flatten()
+                ))
+            xN = coo(ij, tones2[start:end].flatten(), (end-start, int(nclust)))
+            xN = xN.to_dense()
+
+            if lam > 0:
+                xN -= lam/m * (ki[start:end].unsqueeze(-1) * kN.unsqueeze(0))
+
+            iclust[start:end] = torch.argmax(xN, 1)
+        return iclust
 
     ij = torch.vstack((rows_neigh.flatten(), isub[kn].flatten()))
     xN = coo(ij, tones2.flatten(), (n_spikes, nclust))
@@ -88,6 +136,34 @@ def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device=t
 
 def assign_isub(iclust, kn, tones2, nclust, nsub, lam, m,ki,kj, device=torch.device('cuda')):
     n_neigh = kn.shape[1]
+    dense_nbytes = int(nsub) * int(nclust) * tones2.element_size()
+    if use_chunked_gpu_work(dense_nbytes, device):
+        isub = torch.empty(int(nsub), dtype=torch.long, device=device)
+        iclust_expanded = iclust.unsqueeze(-1).expand_as(kn)
+        if lam > 0:
+            kN = torch.bincount(iclust, minlength=int(nclust)).to(
+                device=device, dtype=tones2.dtype
+                )
+
+        for start in range(0, int(nsub), CLUSTERING_ASSIGN_CHUNK):
+            end = min(start + CLUSTERING_ASSIGN_CHUNK, int(nsub))
+            in_chunk = (kn >= start) & (kn < end)
+            if bool(in_chunk.any().item()):
+                iis = torch.vstack((
+                    (kn[in_chunk] - start).flatten(),
+                    iclust_expanded[in_chunk].flatten()
+                    ))
+                vals = tones2[in_chunk].flatten()
+                xS = coo(iis, vals, (end-start, int(nclust))).to_dense()
+            else:
+                xS = torch.zeros((end-start, int(nclust)), device=device)
+
+            if lam > 0:
+                xS -= lam / m * (kj[start:end].unsqueeze(-1) * kN.unsqueeze(0))
+
+            isub[start:end] = torch.argmax(xS, 1)
+        return isub
+
     cols = iclust.unsqueeze(-1).tile((1, n_neigh))
     iis = torch.vstack((kn.flatten(), cols.flatten()))
 
@@ -233,32 +309,55 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
         try:
             # The new centroids to be tested, sampled from the spikes in Xg.
             Xc = Xg[isamp]
-            # Variance explained for each spike for the new centroids.
-            vexp = 2 * Xg @ Xc.T - (Xc**2).sum(1)
-            # Difference between variance explained for new centroids
-            # and best explained variance so far across all iterations.
-            # This gets relu-ed, since only the positive increases will actually
-            # re-assign a spike to this new cluster
-            dexp = torch.relu(vexp - vexp0.unsqueeze(1))
-            # Sum all positive increases to determine additional explained variance
-            # for each candidate centroid.
-            vsum = dexp.sum(0)
-            # Pick the candidate which increases explained variance the most 
-            imax = torch.argmax(vsum)
+            dense_nbytes = 2 * n_spikes * ntry * Xg.element_size()
+            if use_chunked_gpu_work(dense_nbytes, device):
+                Xc_norm = (Xc**2).sum(1)
+                vsum = torch.zeros(ntry, device=device, dtype=Xg.dtype)
+                for start in range(0, n_spikes, CLUSTERING_KMEANS_CHUNK):
+                    end = min(start + CLUSTERING_KMEANS_CHUNK, n_spikes)
+                    vexp = 2 * Xg[start:end] @ Xc.T - Xc_norm
+                    dexp = torch.relu(vexp - vexp0[start:end].unsqueeze(1))
+                    vsum += dexp.sum(0)
 
-            # For that centroid (Xc[imax]), determine which spikes actually get
-            # more variance from it
-            ix = dexp[:, imax] > 0
+                imax = torch.argmax(vsum)
+                xc = Xc[imax]
+                xc_norm = (xc**2).sum()
+                mu[j] = xc
+                for start in range(0, n_spikes, CLUSTERING_KMEANS_CHUNK):
+                    end = min(start + CLUSTERING_KMEANS_CHUNK, n_spikes)
+                    vexp = 2 * (Xg[start:end] @ xc) - xc_norm
+                    ix = vexp > vexp0[start:end]
+                    iclust_chunk = iclust[start:end]
+                    vexp0_chunk = vexp0[start:end]
+                    iclust_chunk[ix] = j
+                    vexp0_chunk[ix] = vexp[ix]
+            else:
+                # Variance explained for each spike for the new centroids.
+                vexp = 2 * Xg @ Xc.T - (Xc**2).sum(1)
+                # Difference between variance explained for new centroids
+                # and best explained variance so far across all iterations.
+                # This gets relu-ed, since only the positive increases will
+                # actually re-assign a spike to this new cluster.
+                dexp = torch.relu(vexp - vexp0.unsqueeze(1))
+                # Sum all positive increases to determine additional explained
+                # variance for each candidate centroid.
+                vsum = dexp.sum(0)
+                # Pick the candidate which increases explained variance the most.
+                imax = torch.argmax(vsum)
 
-            iclust[ix] = j    # assign new cluster identity
-            mu[j] = Xc[imax]  # spike features used as centroid for cluster j
-            # Update variance explained for the spikes assigned to cluster j
-            vexp0[ix] = vexp[ix, imax]
+                # For that centroid (Xc[imax]), determine which spikes actually
+                # get more variance from it.
+                ix = dexp[:, imax] > 0
 
-            # Delete large variables between iterations
-            # to prevent excessive memory reservation.
-            del(vexp)
-            del(dexp)
+                iclust[ix] = j    # assign new cluster identity
+                mu[j] = Xc[imax]  # spike features used as centroid for cluster j
+                # Update variance explained for the spikes assigned to cluster j
+                vexp0[ix] = vexp[ix, imax]
+
+                # Delete large variables between iterations
+                # to prevent excessive memory reservation.
+                del(vexp)
+                del(dexp)
 
         except torch.cuda.OutOfMemoryError:
             logger.debug(f"OOM in kmeans_plus_plus iter {j}, nsp: {Xg.shape[0]}, "

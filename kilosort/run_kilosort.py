@@ -819,6 +819,7 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     Wall3 = template_matching.postprocess_templates(
         Wall, ops, clu, st0, tF, device=device
         )
+    logger.info(f'{Wall3.shape[0]} templates retained after postprocessing')
 
     elapsed = time.time() - tic
     total = time.time() - tic0

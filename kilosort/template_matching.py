@@ -10,6 +10,23 @@ from kilosort.utils import log_performance
 
 logger = logging.getLogger(__name__)
 
+# Number of learned templates to align per convolution call.
+ALIGN_U_CHUNK = 256
+# Number of learned templates to score per matching reduction call.
+MATCHING_SCORE_CHUNK = 512
+# Store the learned-template score matrix on CPU only when it is too large to
+# leave enough room for the other per-batch GPU tensors.
+MATCHING_B_GPU_TOTAL_FRACTION = 0.75
+MATCHING_B_GPU_FREE_FRACTION = 0.85
+# Number of detected spikes to update per residual-data matching call.
+MATCHING_DATA_CHUNK = 128
+# Number of learned templates to update per matching residual call.
+MATCHING_TEMPLATE_CHUNK = 2048
+# Number of detected spikes to update per learned-template matching call.
+MATCHING_CTC_CHUNK = 32
+# Number of detected spikes to extract PC features for at once.
+MATCHING_FEATURE_CHUNK = 4096
+
 
 def prepare_extract(xc, yc, U, nC, position_limit, device=torch.device('cuda')):
     """Identify desired channels based on distances and template norms.
@@ -65,7 +82,7 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
     nt = ops['nt']
     
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
-    ctc = prepare_matching(ops, U)
+    WtW = prepare_matching(ops, U)
     st = np.zeros((10**6, 3), 'float64')
     tF  = torch.zeros((10**6, nC , ops['settings']['n_pcs']))
     k = 0
@@ -81,16 +98,17 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
                 log_performance(logger, 'debug', f'Batch {ibatch}')
 
             X = bfile.padded_batch_to_torch(ibatch, ops)
-            stt, amps, th_amps, Xres = run_matching(ops, X, U, ctc, device=device)
-            xfeat = Xres[iCC[:, iU[stt[:,1:2]]],stt[:,:1] + tiwave] @ ops['wPCA'].T
-            xfeat += amps * Ucc[:,stt[:,1]]
+            stt, amps, th_amps, Xres = run_matching(ops, X, U, WtW, device=device)
+            xfeat = extract_spike_features(
+                Xres, iCC, iU, stt, tiwave, ops['wPCA'], Ucc, amps
+                )
 
             if ibatch == 0:
                 # Can sometimes get negative spike times for first batch since
                 # we're aligning to nt0min, not nt//2, but these should be discarded.
                 neg_spikes = (stt[:,0] - nt - nt//2 + ops['nt0min']) < 0
                 stt = stt[~neg_spikes,:]
-                xfeat = xfeat[:,~neg_spikes,:]
+                xfeat = xfeat[:,(~neg_spikes).cpu(),:]
                 amps = amps[~neg_spikes,:]
                 th_amps = th_amps[~neg_spikes,:]
 
@@ -114,7 +132,8 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
     except:
         logger.exception(f'Error in template_matching.extract on batch {ibatch}')
         logger.debug(f'X shape: {X.shape}')
-        logger.debug(f'stt shape: {stt.shape}')
+        if 'stt' in locals():
+            logger.debug(f'stt shape: {stt.shape}')
         raise
 
     log_performance(logger, 'debug', f'Batch {ibatch}')
@@ -127,18 +146,42 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
 
 
 def align_U(U, ops, device=torch.device('cuda')):
-    Uex = torch.einsum('xyz, zt -> xty', U.to(device), ops['wPCA'])
-    X = Uex.reshape(-1, ops['Nchan']).T
-    X = conv1d(X.unsqueeze(1), ops['wTEMP'].unsqueeze(1), padding=ops['nt']//2)
-    Xmax = X.abs().max(0)[0].max(0)[0].reshape(-1, ops['nt'])
-    imax = torch.argmax(Xmax, 1)
+    nt = ops['nt']
+    padding = nt // 2
+    n_templates = U.shape[0]
+    wPCA = ops['wPCA'].to(device)
+    wTEMP = ops['wTEMP'].to(device).unsqueeze(1)
+    Unew = torch.empty((n_templates, wPCA.shape[0], ops['Nchan']),
+                       dtype=U.dtype, device='cpu')
+    imax = torch.empty(n_templates, dtype=torch.long)
 
-    Unew = Uex.clone() 
-    for j in range(ops['nt']):
-        ix = imax==j
-        Unew[ix] = torch.roll(Unew[ix], ops['nt']//2 - j, -2)
-    Unew = torch.einsum('xty, zt -> xzy', Unew, ops['wPCA'])#.transpose(1,2).cpu()
-    return Unew, imax
+    for start in range(0, n_templates, ALIGN_U_CHUNK):
+        end = min(start + ALIGN_U_CHUNK, n_templates)
+        context_start = max(0, start - 1)
+        context_end = min(n_templates, end + 1)
+        Uex = torch.einsum(
+            'xyz, zt -> xty', U[context_start:context_end].to(device), wPCA
+            )
+        X = Uex.reshape(-1, ops['Nchan']).T
+        Xconv = conv1d(
+            X.unsqueeze(1).contiguous(), wTEMP, padding=padding
+            )
+        target_start = (start - context_start) * nt
+        target_end = target_start + (end - start) * nt
+        Xmax = (
+            Xconv[..., target_start:target_end]
+            .abs().amax((0, 1)).reshape(end - start, nt)
+            )
+        imax_chunk = torch.argmax(Xmax, 1)
+
+        Uchunk = Uex[start-context_start:end-context_start]
+        for j in range(nt):
+            ix = imax_chunk == j
+            Uchunk[ix] = torch.roll(Uchunk[ix], padding - j, -2)
+        Unew[start:end].copy_(torch.einsum('xty, zt -> xzy', Uchunk, wPCA).cpu())
+        imax[start:end] = imax_chunk.cpu()
+
+    return Unew.to(device), imax.to(device)
 
 
 def postprocess_templates(Wall, ops, clu, st, tF, device=torch.device('cuda')):
@@ -157,17 +200,146 @@ def prepare_matching(ops, U):
     W = ops['wPCA'].contiguous()
     WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt) 
     WtW = torch.flip(WtW, [2,])
-
-    #mu = (U**2).sum(-1).sum(-1)**.5
-    #U2 = U / mu.unsqueeze(-1).unsqueeze(-1)
-
-    UtU = torch.einsum('ikl, jml -> ijkm',  U, U)
-    ctc = torch.einsum('ijkm, kml -> ijl', UtU, WtW)
-
-    return ctc
+    return WtW
 
 
-def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
+def use_cpu_matching_scores(n_templates, n_time, dtype, device):
+    device = torch.device(device)
+    if device.type != 'cuda':
+        return False
+
+    b_nbytes = n_templates * n_time * torch.empty((), dtype=dtype).element_size()
+    try:
+        torch.cuda.empty_cache()
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        free_memory, total_memory = torch.cuda.mem_get_info(device_index)
+        return (
+            b_nbytes > MATCHING_B_GPU_FREE_FRACTION * free_memory
+            or b_nbytes > MATCHING_B_GPU_TOTAL_FRACTION * total_memory
+            )
+    except Exception:
+        return False
+
+
+def compute_template_scores_cpu(B_features, U):
+    n_templates = U.shape[0]
+    n_time = B_features.shape[-1]
+    B = torch.empty((n_templates, n_time), dtype=B_features.dtype, device='cpu')
+    for start in range(0, n_templates, MATCHING_SCORE_CHUNK):
+        end = min(start + MATCHING_SCORE_CHUNK, n_templates)
+        B[start:end].copy_(
+            torch.einsum('ijk, kjl -> il', U[start:end], B_features).cpu()
+            )
+    return B
+
+
+def compute_template_scores(B_features, U, device):
+    n_templates = U.shape[0]
+    n_time = B_features.shape[-1]
+    if use_cpu_matching_scores(n_templates, n_time, B_features.dtype, device):
+        logger.info('Using CPU-backed learned-template scores for this batch.')
+        return compute_template_scores_cpu(B_features, U)
+
+    try:
+        return torch.einsum('ijk, kjl -> il', U, B_features)
+    except torch.cuda.OutOfMemoryError:
+        logger.info(
+            'GPU learned-template score allocation failed; falling back to '
+            'CPU-backed scores for this batch.'
+            )
+        torch.cuda.empty_cache()
+        return compute_template_scores_cpu(B_features, U)
+
+
+def get_template_scores(B, iY, iX, device):
+    if B.device.type == 'cpu':
+        return B[iY.cpu(), iX.cpu()].to(device)
+    return B[iY, iX]
+
+
+def extract_spike_features(Xres, iCC, iU, stt, tiwave, wPCA, Ucc, amps):
+    n_spikes = len(stt)
+    xfeat = torch.empty(
+        (iCC.shape[0], n_spikes, wPCA.shape[0]), dtype=Xres.dtype, device='cpu'
+        )
+
+    for start in range(0, n_spikes, MATCHING_FEATURE_CHUNK):
+        end = min(start + MATCHING_FEATURE_CHUNK, n_spikes)
+        stt_chunk = stt[start:end]
+        xfeat_chunk = (
+            Xres[iCC[:, iU[stt_chunk[:, 1:2]]], stt_chunk[:, :1] + tiwave]
+            @ wPCA.T
+            )
+        xfeat_chunk += amps[start:end] * Ucc[:, stt_chunk[:, 1]]
+        xfeat[:, start:end].copy_(xfeat_chunk.cpu())
+
+    return xfeat
+
+
+def template_cross_correlations(U, WtW, template_ids, template_start=0,
+                                template_end=None):
+    if template_end is None:
+        template_end = U.shape[0]
+    Usel = U[template_ids]
+    UtU = torch.einsum('ikl, jml -> ijkm', U[template_start:template_end], Usel)
+    return torch.einsum('ijkm, kml -> ijl', UtU, WtW)
+
+
+def subtract_template_updates(B, U, WtW, iX, iY, amp, trange):
+    b_on_cpu = B.device.type == 'cpu'
+    for start in range(0, len(iX), MATCHING_CTC_CHUNK):
+        end = min(start + MATCHING_CTC_CHUNK, len(iX))
+        time_index = iX[start:end] + trange
+        if b_on_cpu:
+            time_index = time_index.cpu()
+        for template_start in range(0, B.shape[0], MATCHING_TEMPLATE_CHUNK):
+            template_end = min(template_start + MATCHING_TEMPLATE_CHUNK, B.shape[0])
+            ctc = template_cross_correlations(
+                U, WtW, iY[start:end, 0], template_start, template_end
+                )
+            if b_on_cpu:
+                b_chunk = B[template_start:template_end, time_index].to(U.device)
+                b_chunk -= amp[start:end] * ctc
+                B[template_start:template_end, time_index] = b_chunk.cpu()
+            else:
+                B[template_start:template_end, time_index] -= amp[start:end] * ctc
+
+
+def subtract_data_updates(Xres, U, W, iX, iY, amp, tiwave):
+    for start in range(0, len(iX), MATCHING_DATA_CHUNK):
+        end = min(start + MATCHING_DATA_CHUNK, len(iX))
+        waveforms = torch.einsum('ijk, jl -> kil', U[iY[start:end, 0]], W)
+        Xres[:, iX[start:end] + tiwave] -= amp[start:end] * waveforms
+
+
+def matching_score_max(B, nm, nt, device=None):
+    if device is None:
+        device = B.device
+    device = torch.device(device)
+    Cfmax = torch.zeros(B.shape[1], dtype=B.dtype, device=device)
+    imax = torch.zeros(B.shape[1], dtype=torch.long, device=device)
+
+    for start in range(0, B.shape[0], MATCHING_SCORE_CHUNK):
+        end = min(start + MATCHING_SCORE_CHUNK, B.shape[0])
+        if B.device.type == 'cpu':
+            Cf = B[start:end].to(device)
+            Cf.clamp_min_(0).square_()
+        else:
+            Cf = torch.relu(B[start:end]).square_()
+        Cf /= nm[start:end].to(device).unsqueeze(-1)
+        Cf[:, :nt] = 0
+        Cf[:, -nt:] = 0
+        Cfmax_chunk, imax_chunk = torch.max(Cf, 0)
+        is_better = Cfmax_chunk > Cfmax
+        Cfmax[is_better] = Cfmax_chunk[is_better]
+        imax[is_better] = imax_chunk[is_better] + start
+
+    return Cfmax, imax
+
+
+def run_matching(ops, X, U, WtW, device=torch.device('cuda')):
     Th = ops['Th_learned']
     nt = ops['nt']
     max_peels = ops['max_peels']
@@ -177,8 +349,9 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     #mu = nm**.5 
     #U2 = U / mu.unsqueeze(-1).unsqueeze(-1)
 
-    B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
-    B = torch.einsum('ijk, kjl -> il', U, B)
+    B_features = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
+    B = compute_template_scores(B_features, U, device)
+    del B_features
 
     trange = torch.arange(-nt, nt+1, device=device) 
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
@@ -194,15 +367,11 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     for t in range(max_peels):
         # Cf = 2 * B - nm.unsqueeze(-1) 
         # Cf is shape (n_units, n_times)
-        Cf = torch.relu(B)**2 /nm.unsqueeze(-1)
+        Cfmax, imax = matching_score_max(B, nm, nt, device=device)
         #a = 1 + lam
         #b = torch.relu(B) + lam * mu.unsqueeze(-1)
         #Cf = b**2 / a - lam * mu.unsqueeze(-1)**2
 
-        Cf[:, :nt] = 0
-        Cf[:, -nt:] = 0
-
-        Cfmax, imax = torch.max(Cf, 0)
         Cmax  = max_pool1d(Cfmax.unsqueeze(0).unsqueeze(0), (2*nt+1), stride=1, padding=(nt))
 
         #print(Cfmax.shape)
@@ -224,7 +393,7 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
         nsp = len(iX)
         st[k:k+nsp, 0] = iX[:,0]
         st[k:k+nsp, 1] = iY[:,0]
-        amps[k:k+nsp] = B[iY,iX] / nm[iY]
+        amps[k:k+nsp] = get_template_scores(B, iY, iX, device) / nm[iY]
         amp = amps[k:k+nsp]
         th_amps[k:k+nsp] = Cmax[0, 0, iX[:,0], None]**.5
 
@@ -234,8 +403,12 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
 
         n = 2
         for j in range(n):
-            Xres[:, iX[j::n] + tiwave]  -= amp[j::n] * torch.einsum('ijk, jl -> kil', U[iY[j::n,0]], W)
-            B[   :, iX[j::n] + trange]  -= amp[j::n] * ctc[:,iY[j::n,0],:]
+            subtract_data_updates(
+                Xres, U, W, iX[j::n], iY[j::n], amp[j::n], tiwave
+                )
+            subtract_template_updates(
+                B, U, WtW, iX[j::n], iY[j::n], amp[j::n], trange
+                )
 
     st = st[:k]
     amps = amps[:k]
